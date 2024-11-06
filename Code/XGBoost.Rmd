@@ -1,0 +1,397 @@
+---
+title: "MGT 6203 XGBoost"
+author: "Michael Daniels"
+date: "2024-04-21"
+output: html_document
+---
+
+```{r}
+library(xgboost)
+library(Matrix)
+library(data.table)  # or library(dplyr) if you prefer
+library(caret)
+library(ggplot2)
+library(pROC)
+library(httr)
+library(readr)
+```
+
+
+```{r}
+# URL of the Dropbox file
+file_url <- "https://www.dropbox.com/scl/fo/oxy3yrx9xkgfme82y3p3u/h/Data/2024-04-10%20-%20pared.csv?dl=1&rlkey=j1dizwta8ie429w70dpg6g1bp"
+
+# Destination where the file will be saved
+destination_file <- "2024-04-10 - pared.csv"
+
+# Download the file
+GET(url = file_url, write_disk(destination_file, overwrite = TRUE))
+
+# Read the downloaded file (optional, to verify it's downloaded correctly)
+data <- read_csv(destination_file)
+```
+
+```{r}
+data$NAME_CONTRACT_TYPE <- as.numeric(factor(data$NAME_CONTRACT_TYPE))
+data$CODE_GENDER <- as.numeric(factor(data$CODE_GENDER))
+data$FLAG_OWN_CAR <- as.numeric(factor(data$FLAG_OWN_CAR))
+data$FLAG_OWN_REALTY <- as.numeric(factor(data$FLAG_OWN_REALTY))
+```
+
+
+```{r}
+categorical_columns <- sapply(data, is.factor)
+data[categorical_columns] <- lapply(data[categorical_columns], function(x) as.numeric(as.factor(x)))
+
+# Now check for any remaining non-numeric columns and decide what to do with them
+non_numeric_columns <- sapply(data, function(x) !is.numeric(x))
+if(any(non_numeric_columns)) {
+  print(names(data)[non_numeric_columns])
+  # Decide whether to convert these to numeric or remove them
+  # For example, to remove a column named 'non_numeric_column', you would do:
+  # data$non_numeric_column <- NULL
+}
+```
+
+
+```{r}
+# Convert categorical columns to numeric
+categorical_columns <- c("NAME_CONTRACT_TYPE", "CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY",
+                         "NAME_TYPE_SUITE", "NAME_INCOME_TYPE", "NAME_EDUCATION_TYPE", 
+                         "NAME_FAMILY_STATUS", "NAME_HOUSING_TYPE", "OCCUPATION_TYPE", 
+                         "WEEKDAY_APPR_PROCESS_START", "ORGANIZATION_TYPE", "INCOME_CAT")
+
+data[categorical_columns] <- lapply(data[categorical_columns], function(x) as.numeric(as.factor(x)))
+
+# Now, all columns should be numeric, and you can proceed with the data splitting and model training
+set.seed(123)
+indexes <- createDataPartition(data$TARGET, p = 0.7, list = FALSE)
+train_data <- data[indexes, ]
+test_data <- data[-indexes, ]
+
+# Prepare matrices for xgboost.  Testing and training models
+dtrain <- xgb.DMatrix(data = as.matrix(train_data[, -1]), label = train_data$TARGET)
+dtest <- xgb.DMatrix(data = as.matrix(test_data[, -1]), label = test_data$TARGET)
+
+# Continue with XGBoost model training and evaluation as before
+
+```
+
+```{r}
+params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 6,
+    eta = 0.3,
+    gamma = 0,
+    subsample = 1,
+    colsample_bytree = 1
+)
+##Now we train the xgboost model
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100, watchlist = list(train = dtrain, test = dtest), verbose = 1)
+
+```
+
+```{r}
+# Extract Feature Importance
+importance_matrix <- xgb.importance(feature_names = colnames(dtrain), model = xgb_model)
+
+# Plot Feature Importance
+xgb.plot.importance(importance_matrix)
+```
+
+
+```{r}
+preds <- predict(xgb_model, dtest)
+thresholds <- seq(0.025, 1, by = 0.025)
+accuracies <- numeric(length(thresholds))
+names(accuracies) <- as.character(thresholds)
+
+for(threshold in thresholds) {
+  preds_label <- ifelse(preds > threshold, 1, 0)
+  confusionMatrix <- table(test_data$TARGET, preds_label)
+  
+  # Calculate true positives, true negatives, false positives, and false negatives
+  tp <- ifelse('1' %in% rownames(confusionMatrix) & '1' %in% colnames(confusionMatrix), 
+               confusionMatrix['1', '1'], 0)
+  tn <- ifelse('0' %in% rownames(confusionMatrix) & '0' %in% colnames(confusionMatrix), 
+               confusionMatrix['0', '0'], 0)
+  fp <- ifelse('1' %in% rownames(confusionMatrix) & '0' %in% colnames(confusionMatrix), 
+               confusionMatrix['1', '0'], 0)
+  fn <- ifelse('0' %in% rownames(confusionMatrix) & '1' %in% colnames(confusionMatrix), 
+               confusionMatrix['0', '1'], 0)
+  
+  # Calculate accuracy
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  accuracies[as.character(threshold)] <- accuracy
+}
+```
+
+```{r}
+# Find the threshold with the highest accuracy
+max_accuracy <- max(accuracies)
+best_threshold <- as.numeric(names(accuracies)[which.max(accuracies)])
+
+# Plot accuracy rates
+accuracy_df <- data.frame(Threshold = as.numeric(names(accuracies)), Accuracy = accuracies)
+ggplot(accuracy_df, aes(x = Threshold, y = Accuracy)) + 
+  geom_line() + 
+  geom_point() +
+  geom_vline(xintercept = best_threshold, linetype="dashed", color = "red") +
+  annotate("text", x = best_threshold, y = max_accuracy * 1.05, label = paste("Most Accurate:", best_threshold), 
+           color = "red", vjust = 1.5, hjust = 1.75, angle = 90, size = 4) +
+  theme_minimal() +
+  labs(title = paste("Accuracy by Threshold (Best:", best_threshold, "Accuracy:", round(max_accuracy, 4), ")"), 
+       x = "Threshold", y = "Accuracy")
+
+```
+
+```{r}
+# Use the best threshold to make predictions
+best_preds_label <- ifelse(preds > best_threshold, 1, 0)
+
+# Construct the confusion matrix at the best threshold
+best_confusionMatrix <- table(test_data$TARGET, best_preds_label)
+
+print(paste("Highest Accuracy rate at:", best_threshold, ": ", round(max_accuracy,4)*100, "%"))
+
+# Optionally, for a more detailed summary, you can use the confusionMatrix function from the caret package
+confusionMatrix(as.factor(best_preds_label), as.factor(test_data$TARGET))
+
+```
+```{r}
+# preds should contain your model predictions
+# test_data$TARGET contains the true labels
+
+thresholds <- seq(0.025, 1, by = 0.025)
+costs <- numeric(length(thresholds))
+names(costs) <- as.character(thresholds)
+
+C_FP <- 10000  # Cost of a False Positive
+C_FN <- C_FP * 5  # Cost of a False Negative, 10 times more costly
+
+for (threshold in thresholds) {
+  preds_label <- ifelse(preds > threshold, 1, 0)
+  confusionMatrix <- table(Predicted = preds_label, Actual = test_data$TARGET)
+  
+  # Calculate false positives and false negatives
+  FP <- ifelse('1' %in% rownames(confusionMatrix) & '0' %in% colnames(confusionMatrix), 
+               confusionMatrix['1', '0'], 0)
+  FN <- ifelse('0' %in% rownames(confusionMatrix) & '1' %in% colnames(confusionMatrix), 
+               confusionMatrix['0', '1'], 0)
+  
+  # Calculate total cost
+  total_cost <- (C_FP * FP) + (C_FN * FN)
+  costs[as.character(threshold)] <- total_cost
+}
+
+# Finding the optimal threshold
+optimal_index <- which.min(costs)
+optimal_threshold <- thresholds[optimal_index]
+```
+
+```{r}
+# Using the optimal threshold to make predictions
+optimal_preds_label <- ifelse(preds > optimal_threshold, 1, 0)
+
+# Construct the confusion matrix at the optimal threshold
+optimal_confusionMatrix <- table(test_data$TARGET, optimal_preds_label)
+
+# Printing the accuracy rate at the optimal threshold
+optimal_accuracy <- sum(diag(optimal_confusionMatrix)) / sum(optimal_confusionMatrix)
+print(paste("Accuracy rate at optimal threshold (", optimal_threshold, "): ", round(optimal_accuracy, 4) * 100, "%", sep = ""))
+
+# Printing the detailed confusion matrix using the caret package
+optimal_cm <- confusionMatrix(as.factor(optimal_preds_label), as.factor(test_data$TARGET))
+print(optimal_cm)
+
+```
+
+
+
+```{r}
+# Convert thresholds and costs into a data frame for plotting
+# Convert thresholds and costs into a data frame for plotting
+cost_data <- data.frame(Threshold = thresholds, Cost = costs)
+
+# Enhance the plot
+ggplot(cost_data, aes(x = Threshold, y = Cost)) +
+  geom_line() +
+  geom_point(aes(color = as.factor(Threshold %in% c(optimal_threshold, best_threshold))), size = 2.5) +
+  geom_vline(xintercept = optimal_threshold, linetype="dashed", color = "red") +
+  geom_vline(xintercept = best_threshold, linetype="dashed", color = "blue") +
+  annotate("text", x = optimal_threshold, y = max(cost_data$Cost, na.rm = TRUE) * 1.05, 
+           label = paste("Most Cost Efficient:", optimal_threshold), 
+           color = "red", vjust = 1.5, hjust = 1.1, angle = 90, size = 4) +
+  annotate("text", x = best_threshold, y = max(cost_data$Cost, na.rm = TRUE) * 1.05, 
+           label = paste("Most Accurate:", best_threshold), 
+           color = "blue", vjust = 1.5, hjust = 1.1, angle = 90, size = 4) +
+  scale_color_manual(
+    values = c("FALSE" = "black", "TRUE" = "red"),
+    labels = c("Other Thresholds", "Optimal Cost Threshold", "Best Accuracy Threshold"),
+    name = "Legend"
+  ) +
+  labs(
+    title = "Cost and Accuracy at Each Threshold", 
+    subtitle = paste("Most Cost Efficient Threshold:", optimal_threshold, 
+                     ", Most Accurate Threshold:", best_threshold),
+    x = "Threshold", y = "Cost"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+
+```
+
+```{r}
+accuracy_df <- data.frame(Threshold = as.numeric(names(accuracies)), Accuracy = accuracies)
+
+ggplot(accuracy_df, aes(x = Threshold, y = Accuracy)) + 
+  geom_line() + 
+  geom_point() +
+  geom_vline(xintercept = optimal_threshold, linetype="dashed", color = "blue") +
+  geom_vline(xintercept = best_threshold, linetype="dashed", color = "red") +
+  annotate("text", x = optimal_threshold, y = max(accuracy_df$Accuracy, na.rm = TRUE) * 1.05, 
+           label = paste("Most Cost Efficient:", optimal_threshold), 
+           color = "blue", vjust = -0.5, hjust = 1.75, angle = 90, size = 4) +
+  annotate("text", x = best_threshold, y = max(accuracy_df$Accuracy, na.rm = TRUE) * 1.05, 
+           label = paste("Most Accurate:", best_threshold), 
+           color = "red", vjust = -0.5, hjust = 1.75, angle = 90, size = 4) +
+  theme_minimal() +
+  labs(title = paste("Accuracy by Threshold (Best:", best_threshold, "Accuracy:", round(max_accuracy, 4), ")"), 
+       subtitle = paste("Most Cost Efficient Threshold:", optimal_threshold,
+                        ", Most Accurate Threshold:", best_threshold),
+       x = "Threshold", y = "Accuracy")
+
+```
+
+
+
+
+```{r}
+# Using the optimal threshold of 0.075
+preds_label_optimal <- ifelse(preds > optimal_threshold, 1, 0)
+confusionMatrix_optimal <- table(Predicted = preds_label_optimal, Actual = test_data$TARGET)
+
+# Printing the confusion matrix
+print(confusionMatrix_optimal)
+
+# Calculating and printing accuracy
+accuracy_optimal <- sum(diag(confusionMatrix_optimal)) / sum(confusionMatrix_optimal)
+print(paste("Accuracy at optimal threshold:", round(accuracy_optimal,4)*100, "%"))
+
+# Calculating and printing total cost
+FP_optimal <- ifelse('1' %in% rownames(confusionMatrix_optimal) & '0' %in% colnames(confusionMatrix_optimal), 
+                     confusionMatrix_optimal['1', '0'], 0)
+FN_optimal <- ifelse('0' %in% rownames(confusionMatrix_optimal) & '1' %in% colnames(confusionMatrix_optimal), 
+                     confusionMatrix_optimal['0', '1'], 0)
+total_cost_optimal <- (C_FP * FP_optimal) + (C_FN * FN_optimal)
+print(paste("Estimated total cost at optimal threshold:", total_cost_optimal))
+```
+
+```{r}
+preds_label_best <- ifelse(preds > best_threshold, 1, 0)
+confusionMatrix_best <- table(Predicted = preds_label_best, Actual = test_data$TARGET)
+
+# Printing the confusion matrix
+print(confusionMatrix_best)
+
+# Calculating and printing accuracy
+accuracy_best <- sum(diag(confusionMatrix_best)) / sum(confusionMatrix_best)
+
+# Calculating and printing total cost
+FP_best <- ifelse('1' %in% rownames(confusionMatrix_best) & '0' %in% colnames(confusionMatrix_best), 
+                     confusionMatrix_best['1', '0'], 0)
+FN_best <- ifelse('0' %in% rownames(confusionMatrix_best) & '1' %in% colnames(confusionMatrix_best), 
+                     confusionMatrix_best['0', '1'], 0)
+total_cost_best <- (C_FP * FP_best) + (C_FN * FN_best)
+print(paste("Estimated total cost at most accurate threshold:", total_cost_best))
+print(paste("Accuracy at optimal threshold:", round(accuracy_best,4)*100, "%"))
+```
+
+```{r}
+# Calculate percentage change in accuracy
+accuracy_change_percent <- -((accuracy_best - accuracy_optimal) / accuracy_best) * 100
+
+# Calculate percentage change in cost
+cost_change_percent <- ((total_cost_best - total_cost_optimal) / total_cost_best) * 100
+
+# Construct the statement
+statement <- sprintf("For a %.2f%% reduction in accuracy, there was a %.2f%% reduction in wasted expenses.", -accuracy_change_percent, cost_change_percent)
+print(statement)
+
+```
+
+```{r}
+# Use the optimal threshold to make predictions
+optimal_preds_label <- ifelse(preds > optimal_threshold, 1, 0)
+
+# Construct the confusion matrix using the caret package
+confusionMatrix_optimal <- confusionMatrix(as.factor(optimal_preds_label), as.factor(test_data$TARGET))
+
+
+# Convert the confusion matrix into a data frame for ggplot
+cm_optimal_df <- as.data.frame(as.table(confusionMatrix_optimal$table))
+
+# Plotting the confusion matrix for the optimal threshold
+ggplot(cm_optimal_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1.5, color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix for Most Cost Efficient Threshold", x = "Actual Class", y = "Predicted Class") +
+  theme_minimal()
+
+```
+
+```{r}
+
+# Generate the ROC curve object
+roc_obj <- roc(response = test_data$TARGET, predictor = preds)
+
+# Calculate the AUC
+auc_value <- auc(roc_obj)
+print(paste("AUC Value:", auc_value))
+
+roc_data <- data.frame(
+    TPR = roc_obj$sensitivities, 
+    FPR = roc_obj$specificities, 
+    Thresholds = roc_obj$thresholds
+)
+
+# Convert ROC object to a data frame for ggplot
+roc_data <- data.frame(
+    TPR = roc_obj$sensitivities, 
+    FPR = roc_obj$specificities, 
+    Thresholds = roc_obj$thresholds
+)
+
+# Plot ROC curve using ggplot2
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+    geom_line(color = "#2c3e50", size = 1) +
+    geom_area(alpha = 0.2, fill = "#3498db") +
+    theme_minimal() +
+    labs(title = "ROC Curve with ggplot2", x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)", subtitle = paste("AUC =", round(auc_value, 2))) +
+    annotate("text", x = 0.5, y = 0.05, label = paste("AUC =", round(auc_value, 2)), hjust = 0.5, vjust = 0, color = "black", size = 5)
+```
+
+
+```{r}
+# Use the optimal threshold to make predictions
+optimal_preds_label2 <- ifelse(preds > best_threshold, 1, 0)
+
+# Construct the confusion matrix using the caret package
+confusionMatrix_optimal_accuracy <- confusionMatrix(as.factor(optimal_preds_label2), as.factor(test_data$TARGET))
+
+
+# Convert the confusion matrix into a data frame for ggplot
+accuracy_optimal_df <- as.data.frame(as.table(confusionMatrix_optimal_accuracy$table))
+
+# Plotting the confusion matrix for the optimal threshold
+ggplot(accuracy_optimal_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1.5, color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix for Most Accurate Threshold", x = "Actual Class", y = "Predicted Class") +
+  theme_minimal()
+```
+

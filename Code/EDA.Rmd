@@ -1,0 +1,303 @@
+---
+title: "EDA"
+author: "Rando Guy or Gal"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## EDA
+
+```{r}
+# This section is about loading the necessary libraries and the data files we will need
+# loading necessary libraries
+library(readr)
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(tidyverse) # Includes dplyr for data manipulation and ggplot2 for plotting
+library(data.table) # Provides fast data manipulation
+library(GGally) # For extended visualizations
+library(corrplot) # For correlation analysis
+library(caret)
+
+# Reading in files to dataframe
+app_train_df <- read_csv('data/application_train.csv')
+bureau_df <- read_csv('data/bureau.csv')
+dbname <- "mgt6203-edatest.db"
+```
+
+```{r}
+# This section will write out the tables to the sqlite db.
+# Connect to a SQLite database. The one I created was mgt6203.db but whatever you want to call it.
+con <- dbConnect(RSQLite::SQLite(), dbname = dbname)
+# Write data to SQLite
+dbWriteTable(con, "application_train", app_train_df, overwrite = TRUE)
+dbWriteTable(con, "bureau", bureau_df, overwrite = TRUE)
+# Disconnection from the database
+dbDisconnect(con)
+```
+
+```{r}
+# This section tries to create a consolidated DF to work with
+# Connect to a SQLite database another time to do the join. Could do this all in one, but I was creating chunks for any debugging
+con <- dbConnect(RSQLite::SQLite(), dbname = dbname)
+
+testId <- 100002
+
+# Perform inner join
+query <- "
+SELECT
+    application_train.*,
+    SUM(bureau.AMT_CREDIT_SUM) as total_amt_credit_sum,
+    SUM(bureau.AMT_CREDIT_SUM_DEBT) as total_amt_credit_sum_debt
+FROM
+    application_train
+INNER JOIN
+    bureau ON application_train.SK_ID_CURR = bureau.SK_ID_CURR
+WHERE
+    bureau.CREDIT_ACTIVE = 'Active'
+GROUP BY
+    application_train.SK_ID_CURR;
+"
+
+result_df <- dbGetQuery(con, query)
+
+# Disconnection from the database
+dbDisconnect(con)
+
+print(result_df)
+```
+
+```{r}
+# Here, the code focuses on cleaning the data based on the following rules
+# Column names with at least one missing or null data element
+null_columns <- colnames(result_df)[colSums(is.na(result_df)) > 0]
+#print(null_columns)
+
+
+# Total number of rows
+total_rows <- nrow(result_df)
+print(paste("Total number of rows : ", total_rows))
+
+# Count of records with any null value
+count_nulls <- sum(apply(is.na(result_df), 1, any))
+print(paste("Number of records with any null value : ", count_nulls))
+
+# Create a subset of the data where the target columns are missing
+missing_records <- result_df[is.na(result_df$EXT_SOURCE_1) & is.na(result_df$EXT_SOURCE_2) & is.na(result_df$EXT_SOURCE_3), ]
+
+# Count the number of such records
+num_missing_records <- nrow(missing_records)
+
+num_missing_records
+```
+
+```{r}
+# Transformation of the data based on the following rules. I am breaking this into chunks to perform better
+
+# 1. For certain fields it would be appropriate to fill in missing or null values with 0.00
+# Create a vector list of column names that you wish to set missing values to 0.00                                     
+column_names <- c("AMT_ANNUITY", "AMT_GOODS_PRICE", "OWN_CAR_AGE", "OBS_30_CNT_SOCIAL_CIRCLE", "DEF_30_CNT_SOCIAL_CIRCLE", "OBS_60_CNT_SOCIAL_CIRCLE", "DEF_60_CNT_SOCIAL_CIRCLE", "total_amt_credit_sum", "total_amt_credit_sum_debt")
+
+
+# For each column name in the list            
+for (column in column_names) {
+  # Replace NA or NaN with 0.00 in that column
+  result_df[[column]][is.na(result_df[[column]]) | result_df[[column]]==""] <- 0.00
+}
+
+```
+
+```{r}
+# 2. For certain fields, it would be appropriate to fill in missing or null values with 0.00
+# Create a vector list of column names where you wish to replace missing values with "Unknown"
+text_column_names <- c("NAME_TYPE_SUITE", "OCCUPATION_TYPE")
+                     
+# For each column name in the list
+for (column in text_column_names){
+  # Replace NA or "" (blanks) with "Unknown" in that column
+  result_df[[column]][is.na(result_df[[column]]) | result_df[[column]]==""] <- "Unknown"
+}
+```
+
+```{r}
+# 3. For certain fields, it would be appropriate to fill in missing or null values with 1
+# Create a list of column names for which you want to substitute missing/null values with 1
+one_value_columns <- c("CNT_FAM_MEMBERS")
+
+# Iterate over each column name from the list
+for (column in one_value_columns){
+  # Replace NA with 1 in that column
+  result_df[[column]][is.na(result_df[[column]])] <- 1
+}
+
+```
+
+```{r}
+# 4. Here I am checking for records where ALL 3 credit score variables are missing. We will define a new field. In the case where all three are missing, the new field "credit_missing" will be set to 1. Else 0.
+result_df <- mutate(result_df, CREDIT_MISSING = ifelse(is.na(EXT_SOURCE_1) & is.na(EXT_SOURCE_2) & is.na(EXT_SOURCE_3), 1, 0))
+
+```
+
+```{r}
+# 5. This rule accounts for the times where at least 1 but not all 3 are missing by filling in the missing with average of the ones that are there
+
+print(missing_records)
+# Calculate the mean of existing data
+mean_values <- rowMeans(result_df[, c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")], na.rm = TRUE)
+
+# Replace missing values based on condition
+for (i in 1:nrow(result_df)) {
+  if (result_df$CREDIT_MISSING[i] == 0) {
+    for (col in c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")) {
+      if (is.na(result_df[i, col])) {
+        result_df[i, col] <- mean_values[i]
+      }
+    }
+  }
+}
+```
+
+```{r}
+# OUTLIERS WORK
+
+result_df %>% mutate(CNT_CHILDREN = ifelse(CNT_CHILDREN>4,4,CNT_CHILDREN))
+
+result_df <- result_df[result_df$AMT_INCOME_TOTAL <= 10000000, ]
+```
+
+```{r}
+# Adding code to create a categorical variables for income called INCOME_CAT
+# First, checking for all values in column
+
+# Check for missing values in a column
+missing_values <- sum(is.na(result_df$AMT_INCOME_TOTAL))
+
+if (missing_values > 0) {
+  print(paste("There are", missing_values, "missing values in the column 'column_name'."))
+} else {
+  print("There are no missing values in the column 'AMT_INCOME_TOTAL'.")
+}
+
+result_df <- result_df %>%
+  mutate(INCOME_CAT = case_when(
+    AMT_INCOME_TOTAL <= 30000 ~ "Lower",
+    AMT_INCOME_TOTAL <= 58020 ~ "Lower-middle",
+    AMT_INCOME_TOTAL <= 94000 ~ "Middle",
+    AMT_INCOME_TOTAL <= 153000 ~ "Upper-middle",
+    TRUE ~ "Upper"
+  ))
+
+```
+
+```{r}
+# Creating subset of numeric only fields for the exploratory tactics such as correlation 
+
+# Identify numeric columns
+numeric_columns <- sapply(result_df, is.numeric)
+
+# Keep only numeric columns
+result_df_numeric <- result_df[, numeric_columns]
+```
+
+```{r}
+# Identify numeric columns first
+numeric_data <- result_df[, sapply(result_df, is.numeric)]
+
+# Find columns with zero variance
+zero_var_cols <- sapply(numeric_data, function(x) var(x, na.rm = TRUE) == 0)
+
+# Print columns to be removed (optional)
+cat("Removing columns with zero variance:\n", names(numeric_data)[zero_var_cols], "\n")
+
+# Remove zero variance columns from the data
+numeric_data <- numeric_data[, !zero_var_cols]
+
+# Removing rows with any NA values
+clean_numeric_data <- na.omit(numeric_data)
+
+# Check for zero or near-zero variance using the nearZeroVar function from caret
+nzv_cols <- nearZeroVar(clean_numeric_data, saveMetrics = TRUE)
+
+# Display the columns that are problematic
+nzv_cols
+
+# Remove these columns from the data
+clean_numeric_data <- clean_numeric_data[, !nzv_cols$nzv]
+
+# Apply PCA
+if(ncol(clean_numeric_data) > 0) {
+  pca_results <- prcomp(clean_numeric_data, scale. = TRUE)
+  summary(pca_results)  # Check the importance of the components
+
+  # Visualize the PCA results to assess component significance
+  plot(pca_results, type = "lines")
+} else {
+  cat("No suitable data available for PCA after removing constant columns.")
+}
+
+# Visualize the variance explained by each principal component
+plot(pca_results, type = "lines")
+
+# Examine the loadings of the first few components
+loadings(pca_results)
+```
+
+```{r}
+# Plot the loadings
+loadings_plot <- biplot(pca_results)
+print(loadings_plot)
+
+# Examine the contribution of each variable
+loadings <- pca_results$rotation
+print(abs(loadings))
+
+# Plot the variance explained by each component
+plot(pca_results, type = "lines")
+
+library(cluster)
+set.seed(123)  # For reproducibility
+kmeans_results <- kmeans(pca_results$x[, 1:3], centers = 3)  # Using the first 3 components
+plot(pca_results$x[, 1:2], col = kmeans_results$cluster)  # Plot clusters
+
+# Visualizing higher dimensions
+pairs(pca_results$x[, 1:4])
+
+ggplot(data = as.data.frame(pca_results$x[, 1:3]), aes(x = PC1, y = PC2, color = as.factor(kmeans_results$cluster))) +
+  geom_point(alpha = 0.5) +
+  labs(title = "PCA and k-Means Clustering")
+```
+
+```{r}
+cor_data <- cbind(pca_results$x[, 1:3], result_df$target_variable)
+cor(cor_data)
+```
+
+```{r}
+# Code to create consolidated_pared_file table which reduces number of columns to working set
+con <- dbConnect(RSQLite::SQLite(), dbname = dbname)
+dbWriteTable(con, "consolidated_file", result_df, overwrite = TRUE)
+# Disconnection from the database
+dbDisconnect(con)
+write.csv(result_df, file = "my_data.csv")
+```
+
+```{r}
+# Creating pared file from table. Note, new table created via pared.sql which is in the code
+con <- dbConnect(RSQLite::SQLite(), dbname = "mgt6203.db")
+
+query <- "SELECT * FROM consolidated_file_pared"
+pared_df <- dbGetQuery(con, query)
+
+dbDisconnect(con)
+
+head(pared_df)
+
+write.csv(pared_df, "pared.csv", row.names = FALSE)
+```
+
+\
